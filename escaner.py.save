@@ -1,0 +1,186 @@
+import ccxt.async_support as ccxt
+import asyncio
+import csv
+import os
+import httpx
+import json
+import time
+import socket
+from datetime import datetime
+import config  # Traigo la config (IP, puertos y keys)
+
+# --- Configs del scanner ---
+LOG_FILE = 'arbitraje_log.csv'
+MIN_ROI_LOG = 0 # Minimo para que salte en consola/tg
+TELEGRAM_TOKEN = '8006141461:AAEaFm7rnj1cG7IroySsQ0PMOgktLQY8K8g'
+TELEGRAM_CHAT_ID = '-5008493083'
+
+class TriangularArbBot:
+    def __init__(self):
+        self.exchange = ccxt.binance({
+            'enableRateLimit': True,
+            'options': {'defaultType': 'spot'}
+        })
+        self.markets = {}
+        self.init_logger()
+
+    def init_logger(self):
+        if not os.path.isfile(LOG_FILE):
+            with open(LOG_FILE, mode='w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Timestamp", "Ruta", "ROI (%)", "Capital Final", "Paso 1", "Paso 2", "Paso 3"])
+
+    async def send_telegram_message(self, message):
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+        async with httpx.AsyncClient() as client:
+            try:
+                await client.post(url, json=payload)
+            except:
+                pass
+
+    async def send_to_executor(self, opportunity):
+        """Le paso la oportunidad al executor por socket"""
+        try:
+            reader, writer = await asyncio.open_connection(config.HOST, config.PORT)
+            message = json.dumps(opportunity)
+            writer.write(message.encode())
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            print(f"⚡ ORDEN ENVIADA AL EXECUTOR: {opportunity['roi']:.2f}%")
+        except ConnectionRefusedError:
+            print("⚠️ Executor desconectado (Solo modo observación)")
+        except Exception as e:
+            print(f"❌ Error Socket: {e}")
+
+    async def load_data(self):
+        print("⏳ Cargando mercados...")
+        self.markets = await self.exchange.load_markets()
+        print(f"✅ Mercados cargados: {len(self.markets)}")
+
+    def get_triangular_pairs(self, currency):
+        triangles = []
+        # --- Filtro: Saco TRY porque jode el spread ---
+        blocked_assets = ['TRY'] 
+        
+        for sym_b in self.markets:
+            base_b, quote_b = sym_b.split('/')
+            
+            # Salto TRY en paso 1
+            if any(asset in [base_b, quote_b] for asset in blocked_assets): continue
+
+            if base_b == currency: step1 = quote_b
+            elif quote_b == currency: step1 = base_b
+            else: continue
+
+            for sym_c in self.markets:
+                base_c, quote_c = sym_c.split('/')
+
+                # Salto TRY en paso 2
+                if any(asset in [base_c, quote_c] for asset in blocked_assets): continue
+
+                if step1 == base_c: step2 = quote_c
+                elif step1 == quote_c: step2 = base_c
+                else: continue
+
+                if step2 == currency: continue
+
+                pair_ca, pair_ac = f"{step2}/{currency}", f"{currency}/{step2}"
+                pair3 = pair_ca if pair_ca in self.markets else (pair_ac if pair_ac in self.markets else None)
+
+                if pair3:
+                    triangles.append({
+                        'pair1': sym_b, 'pair2': sym_c, 'pair3': pair3,
+                        'moneda_a': currency, 'moneda_b': step1, 'moneda_c': step2
+                    })
+        return triangles
+
+    def calculate_step(self, ticker, pair, input_amount, goal):
+        base, quote = pair.split('/')
+        bid, ask = ticker['bid'], ticker['ask']
+
+        if not bid or not ask: return 0.0, "Sin liquidez", 0.0
+
+        if goal == base: # COMPRA
+            price = ask
+            if price == 0: return 0.0, "Price 0", 0.0
+            out = input_amount / ask
+            detail = f"BUY {base} @ {ask}"
+        else: # VENTA
+            price = bid
+            out = input_amount * bid
+            detail = f"SELL {base} @ {bid}"
+
+        return out * (1 - config.FEE), detail, price
+
+    async def scan_market(self):
+        triangles = self.get_triangular_pairs(config.BASE_ARBITRAJE)
+        print(f"🔄 Rutas triangulares activas (Sin TRY): {len(triangles)}")
+        print(f"🚀 ESCANER AGRESIVO INICIADO. ROI MIN LOG: {MIN_ROI_LOG}% | ROI EXEC: {config.MIN_ROI_EXEC}%")
+
+        while True:
+            try:
+                tickers = await self.exchange.fetch_tickers()
+                
+                for t in triangles:
+                    p1, p2, p3 = t['pair1'], t['pair2'], t['pair3']
+                    if p1 not in tickers or p2 not in tickers or p3 not in tickers: continue
+
+                    # PASO 1
+                    r1, d1, price1 = self.calculate_step(tickers[p1], p1, config.CAPITAL_INICIAL, t['moneda_b'])
+                    if r1 == 0: continue
+
+                    # PASO 2
+                    r2, d2, price2 = self.calculate_step(tickers[p2], p2, r1, t['moneda_c'])
+                    if r2 == 0: continue
+
+                    # PASO 3
+                    r3, d3, price3 = self.calculate_step(tickers[p3], p3, r2, t['moneda_a'])
+                    if r3 == 0: continue
+
+                    roi = ((r3 - config.CAPITAL_INICIAL) / config.CAPITAL_INICIAL) * 100
+
+                    # 1. Logueo si pasa el filtro visual
+                    if roi > MIN_ROI_LOG:
+                        ruta_str = f"{t['moneda_a']}->{t['moneda_b']}->{t['moneda_c']}->{t['moneda_a']}"
+                        print(f"👀 OJO: {roi:.3f}% | {ruta_str}")
+                        
+                        if roi > 0.5: 
+                             await self.send_telegram_message(f"🚀 *Arbitraje*\nROI: `{roi:.4f}%`\nRuta: `{ruta_str}`")
+
+                        with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+                            csv.writer(f).writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ruta_str, f"{roi:.4f}", f"{r3:.6f}", d1, d2, d3])
+
+                    # 2. Si da la guita, mando al executor
+                    if roi >= config.MIN_ROI_EXEC:
+                        print(f"🔥 ¡ENVIANDO ORDEN REAL! ROI: {roi:.3f}%")
+                        opportunity = {
+                            "roi": roi,
+                            "symbols": [p1, p2, p3],
+                            "prices": {p1: price1, p2: price2, p3: price3},
+                            "timestamp": time.time()
+                        }
+                        await self.send_to_executor(opportunity)
+                        await asyncio.sleep(5) 
+
+                await asyncio.sleep(1)
+
+            except Exception as e:
+                print("ERROR SCAN:", e)
+                await asyncio.sleep(5)
+
+    async def close(self):
+        await self.exchange.close()
+
+async def main():
+    bot = TriangularArbBot()
+    try:
+        await bot.load_data()
+        await bot.scan_market()
+    finally:
+        await bot.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+f
